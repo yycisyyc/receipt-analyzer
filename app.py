@@ -169,12 +169,29 @@ def classify_amount(amount: float) -> dict:
         }
 
 
-def build_excel(records: list[dict]) -> bytes:
-    """生成 Excel 文件并返回二进制内容。"""
-    wb = Workbook()
+def get_meal_period(time_str: str) -> str:
+    """根据小时判断午餐/晚餐。15点前为午餐，15点及之后为晚餐。"""
+    try:
+        hour = int(time_str[11:13])
+        return "午餐" if hour < 15 else "晚餐"
+    except Exception:
+        return "未知"
 
-    # ---- 样式 ----
-    header_font = Font(bold=True, size=11)
+
+def get_date(time_str: str) -> str:
+    """从时间字符串中提取日期部分。"""
+    try:
+        return time_str[:10]
+    except Exception:
+        return "未知"
+
+
+def build_excel(records: list[dict]) -> bytes:
+    """生成 Excel 文件并返回二进制内容（含明细、日汇总、月汇总三个 Sheet）。"""
+    wb = Workbook()
+    from collections import defaultdict
+
+    # ---- 公共样式 ----
     header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
     header_font_white = Font(bold=True, size=11, color="FFFFFF")
     thin_border = Border(
@@ -186,19 +203,36 @@ def build_excel(records: list[dict]) -> bytes:
     center = Alignment(horizontal="center", vertical="center")
     money_fmt = '#,##0.00'
 
+    def write_header(ws, headers, col_widths):
+        for col_idx, (h, w) in enumerate(zip(headers, col_widths), 1):
+            cell = ws.cell(row=1, column=col_idx, value=h)
+            cell.font = header_font_white
+            cell.fill = header_fill
+            cell.alignment = center
+            cell.border = thin_border
+            ws.column_dimensions[cell.column_letter].width = w
+
+    def write_row(ws, row_idx, values, money_cols=None):
+        money_cols = money_cols or set()
+        for col_idx, val in enumerate(values, 1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=val)
+            cell.border = thin_border
+            cell.alignment = center
+            if col_idx in money_cols:
+                cell.number_format = money_fmt
+
     # ========== Sheet 1: 收款明细 ==========
     ws1 = wb.active
     ws1.title = "收款明细"
-    headers = ["序号", "金额", "支付时间", "支付方式", "餐费", "打包盒费", "饮料费", "备注"]
-    col_widths = [6, 10, 22, 10, 10, 10, 10, 14]
+    headers1 = ["序号", "日期", "金额", "支付时间", "餐段", "支付方式", "餐费", "打包盒费", "饮料费", "备注"]
+    widths1 = [6, 12, 10, 22, 8, 10, 10, 10, 10, 14]
+    write_header(ws1, headers1, widths1)
 
-    for col_idx, (h, w) in enumerate(zip(headers, col_widths), 1):
-        cell = ws1.cell(row=1, column=col_idx, value=h)
-        cell.font = header_font_white
-        cell.fill = header_fill
-        cell.alignment = center
-        cell.border = thin_border
-        ws1.column_dimensions[cell.column_letter].width = w
+    # 用于日汇总的聚合
+    daily = defaultdict(lambda: {
+        "income": 0, "count": 0, "meal": 0, "box": 0, "drink": 0,
+        "wechat": 0, "wechat_n": 0, "alipay": 0, "alipay_n": 0,
+    })
 
     total_meal = total_box = total_drink = total_income = 0
     wechat_total = alipay_total = 0
@@ -207,23 +241,15 @@ def build_excel(records: list[dict]) -> bytes:
     for i, rec in enumerate(records, 1):
         amt = rec["amount"]
         cls = classify_amount(amt)
-        row_data = [
-            i,
-            amt,
-            rec["time"],
-            rec["method"],
-            cls["meal"],
-            cls["box"],
-            cls["drink"],
-            cls["note"],
-        ]
-        for col_idx, val in enumerate(row_data, 1):
-            cell = ws1.cell(row=i + 1, column=col_idx, value=val)
-            cell.border = thin_border
-            cell.alignment = center
-            if col_idx in (2, 5, 6, 7):
-                cell.number_format = money_fmt
+        date_str = get_date(rec["time"])
+        period = get_meal_period(rec["time"])
 
+        write_row(ws1, i + 1, [
+            i, date_str, amt, rec["time"], period, rec["method"],
+            cls["meal"], cls["box"], cls["drink"], cls["note"],
+        ], money_cols={3, 7, 8, 9})
+
+        # 累加总计
         total_income += amt
         total_meal += cls["meal"]
         total_box += cls["box"]
@@ -235,28 +261,62 @@ def build_excel(records: list[dict]) -> bytes:
             alipay_total += amt
             alipay_count += 1
 
-    # ========== Sheet 2: 汇总 ==========
-    ws2 = wb.create_sheet("汇总")
-    summary_header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+        # 累加日汇总
+        d = daily[date_str]
+        d["income"] += amt
+        d["count"] += 1
+        d["meal"] += cls["meal"]
+        d["box"] += cls["box"]
+        d["drink"] += cls["drink"]
+        if rec["method"] == "微信":
+            d["wechat"] += amt
+            d["wechat_n"] += 1
+        else:
+            d["alipay"] += amt
+            d["alipay_n"] += 1
 
-    # 从记录中提取日期范围
-    dates = []
-    for rec in records:
-        try:
-            dates.append(rec["time"][:10])
-        except Exception:
-            pass
+    # ========== Sheet 2: 日汇总 ==========
+    ws2 = wb.create_sheet("日汇总")
+    headers2 = ["日期", "总收入", "总笔数", "就餐人数", "总餐费", "总打包盒费", "总饮料费",
+                 "微信收款", "微信笔数", "支付宝收款", "支付宝笔数"]
+    widths2 = [12, 12, 8, 10, 12, 12, 12, 12, 10, 12, 10]
+    write_header(ws2, headers2, widths2)
+
+    for row_idx, date_str in enumerate(sorted(daily.keys()), 2):
+        d = daily[date_str]
+        customers = int(round(d["meal"] / MEAL_PRICE))
+        write_row(ws2, row_idx, [
+            date_str,
+            round(d["income"], 2),
+            d["count"],
+            customers,
+            round(d["meal"], 2),
+            round(d["box"], 2),
+            round(d["drink"], 2),
+            round(d["wechat"], 2),
+            d["wechat_n"],
+            round(d["alipay"], 2),
+            d["alipay_n"],
+        ], money_cols={2, 5, 6, 7, 8, 10})
+
+    # ========== Sheet 3: 月汇总 ==========
+    ws3 = wb.create_sheet("月汇总")
+
+    dates = sorted(daily.keys())
     if dates:
-        date_min, date_max = min(dates), max(dates)
+        date_min, date_max = dates[0], dates[-1]
         date_range = date_min if date_min == date_max else f"{date_min} ~ {date_max}"
     else:
         date_range = "未知"
+
+    total_customers = int(round(total_meal / MEAL_PRICE))
 
     summary = [
         ("项目", "金额/数量"),
         ("日期范围", date_range),
         ("总营业收入", round(total_income, 2)),
         ("总笔数", len(records)),
+        ("就餐人数（总）", total_customers),
         ("总餐费", round(total_meal, 2)),
         ("总打包盒费", round(total_box, 2)),
         ("总饮料费", round(total_drink, 2)),
@@ -267,12 +327,12 @@ def build_excel(records: list[dict]) -> bytes:
         ("支付宝笔数", alipay_count),
     ]
 
-    ws2.column_dimensions["A"].width = 16
-    ws2.column_dimensions["B"].width = 16
+    ws3.column_dimensions["A"].width = 18
+    ws3.column_dimensions["B"].width = 16
 
     for row_idx, (label, value) in enumerate(summary, 1):
-        c1 = ws2.cell(row=row_idx, column=1, value=label)
-        c2 = ws2.cell(row=row_idx, column=2, value=value)
+        c1 = ws3.cell(row=row_idx, column=1, value=label)
+        c2 = ws3.cell(row=row_idx, column=2, value=value)
         c1.border = thin_border
         c2.border = thin_border
         c1.alignment = center
@@ -280,8 +340,8 @@ def build_excel(records: list[dict]) -> bytes:
         if row_idx == 1:
             c1.font = header_font_white
             c2.font = header_font_white
-            c1.fill = summary_header_fill
-            c2.fill = summary_header_fill
+            c1.fill = header_fill
+            c2.fill = header_fill
         elif isinstance(value, float):
             c2.number_format = money_fmt
 
