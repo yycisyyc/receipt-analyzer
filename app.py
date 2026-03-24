@@ -2,19 +2,27 @@ import streamlit as st
 
 st.set_page_config(page_title="餐饮工具箱", page_icon="🍽️", layout="centered")
 
-st.title("🍽️ 餐饮工具箱")
+if "current_page" not in st.session_state:
+    st.session_state.current_page = "home"
 
-st.markdown("""
-**👈 请从左侧边栏选择功能：**
+if st.session_state.current_page == "kuaican":
+    import kuaican
+    kuaican.run()
+elif st.session_state.current_page == "restaurant":
+    import restaurant
+    restaurant.run()
+else:
+    st.title("🍽️ 餐饮工具箱")
+    st.markdown("---")
 
----
-
-### 🍚 十五元快餐分析
-上传收款助手截图，自动识别并按餐费/打包盒/饮料分类，生成 Excel 报表。
-
-### 📋 餐厅日报表
-上传手写日报照片，AI 识别后生成标准格式的 Excel 日报表。
-
----
-*点击左侧边栏中的页面名称即可进入对应功能。*
-""")
+    col1, col2 = st.columns(2, gap="large")
+    with col1:
+        if st.button("🍚\n\n**十五元快餐分析**\n\n上传收款助手截图\n自动分类生成报表",
+                      use_container_width=True):
+            st.session_state.current_page = "kuaican"
+            st.rerun()
+    with col2:
+        if st.button("📋\n\n**餐厅日报表**\n\n上传手写日报照片\nAI识别生成Excel",
+                      use_container_width=True):
+            st.session_state.current_page = "restaurant"
+            st.rerun()
