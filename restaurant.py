@@ -94,14 +94,26 @@ _HFONT = Font(bold=True, size=10, color="FFFFFF")
 _BFONT = Font(bold=True, size=10)
 _MFMT = '#,##0.00'
 
-DAY_HEADERS = ["序号", "中餐/晚餐", "包间号", "营业额", "折扣", "收入",
-               "手续费", "充值", "实收", "挂账", "挂账收回",
-               "会员卡赠送", "会员卡消费", "会员卡余额", "付款方式", "酒水", "备注"]
-DAY_WIDTHS = [6, 10, 8, 10, 8, 10, 10, 8, 10, 8, 10, 10, 10, 10, 12, 8, 14]
+# 匹配模板：A-R 共 18 列
+DAY_HEADERS = [
+    "序号", "中餐/晚餐", "包间号", "营业额", "折扣", "收入",
+    "手续费", "饿了么", "实收", "挂账", "挂账收回",
+    "会员卡赠送", "会员卡消费", "陈其兵", "付款方式", "酒水", "备注", "充值",
+]
+DAY_WIDTHS = [6, 10, 8, 10, 8, 10, 10, 8, 10, 8, 10, 10, 10, 10, 12, 8, 14, 8]
 
-SUMMARY_HEADERS = ["序号", "日期", "营业额", "折扣", "收入", "手续费", "充值",
-                   "实收", "挂账", "挂账收回", "会员卡赠送", "会员卡消费", "会员卡余额"]
-SUMMARY_WIDTHS = [6, 12, 12, 10, 12, 10, 10, 12, 10, 10, 12, 12, 12]
+# 汇总表列头匹配模板
+SUMMARY_HEADERS = [
+    "序号", "日期", "营业额", "折扣", "收入", "手续费", "饿了么",
+    "实收", "挂账", "挂账收回", "会员卡赠送", "会员卡消费", "陈其兵", "酒水",
+]
+SUMMARY_WIDTHS = [6, 12, 12, 10, 12, 10, 8, 12, 10, 10, 12, 12, 12, 10]
+
+# 汇总表列 → 日sheet row28 列字母（D=营业额, E=折扣, ..., P=酒水）
+_SUMMARY_DAY_COL_MAP = {
+    3: "D", 4: "E", 5: "F", 6: "G", 7: "H", 8: "I",
+    9: "J", 10: "K", 11: "L", 12: "M", 13: "N", 14: "P",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +228,15 @@ def _has_uncertain(day_data):
     return False
 
 
+def _sheet_has_data(ws):
+    """判断一个日 sheet 是否有实际流水数据（D列 row 3-27 有数字）。"""
+    for r in range(3, 28):
+        v = ws.cell(row=r, column=4).value
+        if v is not None and isinstance(v, (int, float)) and v > 0:
+            return True
+    return False
+
+
 def _flatten_rows_for_excel(rows):
     """将带 payments 数组的行展开为每个支付方式一行。同一单序号相同。"""
     flat = []
@@ -260,8 +281,51 @@ def _flatten_rows_for_excel(rows):
     return flat
 
 
+def _fill_day_data(ws, day_data):
+    """往已有模板 sheet 中填入数据（只写数据行 3-27，保留表头和合计公式）。"""
+    # 清空数据区 B3:R27
+    for r in range(3, 28):
+        for c in range(2, 19):
+            ws.cell(row=r, column=c).value = None
+
+    flat = _flatten_rows_for_excel(day_data.get("rows", []))
+    current_row = 3
+
+    for entry in flat:
+        if current_row > 27:
+            break
+        r = current_row
+        current_row += 1
+
+        ws.cell(row=r, column=1, value=entry["seq"])
+        ws.cell(row=r, column=2, value=entry["period"])
+        ws.cell(row=r, column=3, value=entry["room"])
+
+        if entry["is_first"] and entry["revenue"]:
+            ws.cell(row=r, column=4, value=entry["revenue"])
+
+        if entry["is_first"] and entry["revenue"] and entry["row_income"]:
+            discount = round(entry["revenue"] - entry["row_income"], 2)
+            if discount > 0:
+                ws.cell(row=r, column=5, value=discount)
+
+        ws.cell(row=r, column=6, value=entry["income"])
+        ws.cell(row=r, column=7, value=entry["fee"])
+        ws.cell(row=r, column=9, value=f"=F{r}-G{r}")
+        ws.cell(row=r, column=15, value=entry["payment"])
+
+        if entry.get("drinks"):
+            ws.cell(row=r, column=16, value=entry["drinks"])
+        if entry.get("row_note"):
+            ws.cell(row=r, column=17, value=entry["row_note"])
+
+    notes = day_data.get("notes", "")
+    if notes:
+        ws.cell(row=29, column=10, value=f"备注：{notes}")
+
+
 def _write_day_sheet(ws, day_data):
-    """填写一个日结 sheet。"""
+    """从零创建一个日结 sheet（用于没有模板的情况）。"""
     date_str = day_data.get("date", "")
     try:
         dt = datetime.strptime(date_str, "%Y-%m-%d")
@@ -275,22 +339,21 @@ def _write_day_sheet(ws, day_data):
         c.font, c.fill, c.alignment, c.border = _HFONT, _HFILL, _CENTER, _BORDER
         ws.column_dimensions[c.column_letter].width = w
 
-    # 预填行 3-27 的边框和序号
     for ri in range(3, 28):
         ws.cell(row=ri, column=1, value=ri - 2).border = _BORDER
         ws.cell(row=ri, column=1).alignment = _CENTER
-        for ci in range(2, 18):
+        for ci in range(2, 19):
             ws.cell(row=ri, column=ci).border = _BORDER
             ws.cell(row=ri, column=ci).alignment = _CENTER
 
     flat = _flatten_rows_for_excel(day_data.get("rows", []))
-    current_excel_row = 3
+    current_row = 3
 
     for entry in flat:
-        if current_excel_row > 27:
+        if current_row > 27:
             break
-        r = current_excel_row
-        current_excel_row += 1
+        r = current_row
+        current_row += 1
 
         ws.cell(row=r, column=1, value=entry["seq"])
         ws.cell(row=r, column=2, value=entry["period"])
@@ -306,7 +369,8 @@ def _write_day_sheet(ws, day_data):
 
         ws.cell(row=r, column=6, value=entry["income"]).number_format = _MFMT
         ws.cell(row=r, column=7, value=entry["fee"]).number_format = _MFMT
-        ws.cell(row=r, column=9, value=entry["actual"]).number_format = _MFMT
+        ws.cell(row=r, column=9, value=f"=F{r}-G{r}")
+        ws.cell(row=r, column=9).number_format = _MFMT
         ws.cell(row=r, column=15, value=entry["payment"])
 
         if entry.get("drinks"):
@@ -318,7 +382,7 @@ def _write_day_sheet(ws, day_data):
     ws.cell(row=28, column=1, value="合计").font = _BFONT
     ws.cell(row=28, column=1).border = _BORDER
     ws.cell(row=28, column=1).alignment = _CENTER
-    for ci in range(4, 18):
+    for ci in range(2, 19):
         cl = get_column_letter(ci)
         c = ws.cell(row=28, column=ci)
         c.value = f"=SUM({cl}3:{cl}27)"
@@ -353,13 +417,9 @@ def _write_summary_sheet(ws, day_sheets: list[str]):
         c.font, c.fill, c.alignment, c.border = _HFONT, _HFILL, _CENTER, _BORDER
         ws.column_dimensions[c.column_letter].width = w
 
-    # day_sheet -> row 28 column mapping:
-    # 日sheet D28=营业额, E28=折扣, F28=收入, G28=手续费, H28=充值, I28=实收,
-    # J28=挂账, K28=挂账收回, L28=会员卡赠送, M28=会员卡消费, N28=会员卡余额
-    day_col_map = {3: "D", 4: "E", 5: "F", 6: "G", 7: "H", 8: "I",
-                   9: "J", 10: "K", 11: "L", 12: "M", 13: "N"}
+    sorted_days = sorted(day_sheets, key=lambda x: int(x) if x.isdigit() else 99)
 
-    for idx, day_num_str in enumerate(sorted(day_sheets, key=lambda x: int(x) if x.isdigit() else 99)):
+    for idx, day_num_str in enumerate(sorted_days):
         row = idx + 4
         ws.cell(row=row, column=1, value=idx + 1).border = _BORDER
         ws.cell(row=row, column=1).alignment = _CENTER
@@ -367,16 +427,17 @@ def _write_summary_sheet(ws, day_sheets: list[str]):
         ws.cell(row=row, column=2).border = _BORDER
         ws.cell(row=row, column=2).alignment = _CENTER
 
-        for summary_col, day_col_letter in day_col_map.items():
+        for summary_col, day_col_letter in _SUMMARY_DAY_COL_MAP.items():
             c = ws.cell(row=row, column=summary_col)
             c.value = f"='{day_num_str}'!{day_col_letter}28"
             c.number_format = _MFMT
             c.border = _BORDER
             c.alignment = _CENTER
 
-    # 合计行
-    total_row = len(day_sheets) + 4
-    for ci in range(3, 14):
+    # 合计行 (row 39 位置，匹配模板)
+    total_row = len(sorted_days) + 4
+    ws.cell(row=total_row, column=1, value="合计").font = _BFONT
+    for ci in range(3, 15):
         cl = get_column_letter(ci)
         c = ws.cell(row=total_row, column=ci)
         c.value = f"=SUM({cl}4:{cl}{total_row - 1})"
@@ -389,11 +450,9 @@ def _build_excel(all_days, existing_wb=None):
     """生成完整 Excel，支持合并已有工作簿。"""
     if existing_wb:
         wb = existing_wb
-        existing_sheets = set(wb.sheetnames)
     else:
         wb = Workbook()
         wb.remove(wb.active)
-        existing_sheets = set()
 
     for day_data in sorted(all_days, key=lambda d: d.get("date", "")):
         date_str = day_data.get("date", "")
@@ -403,13 +462,16 @@ def _build_excel(all_days, existing_wb=None):
         except Exception:
             sheet_name = date_str or "未知"
 
-        if sheet_name in existing_sheets:
-            continue
+        if sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            if _sheet_has_data(ws):
+                continue
+            _fill_day_data(ws, day_data)
+        else:
+            ws = wb.create_sheet(sheet_name)
+            _write_day_sheet(ws, day_data)
 
-        ws = wb.create_sheet(sheet_name)
-        _write_day_sheet(ws, day_data)
-
-    # 生成/更新汇总表
+    # 生成/更新汇总表（不删除已有的，只更新公式引用）
     if "汇总" in wb.sheetnames:
         del wb["汇总"]
     ws_summary = wb.create_sheet("汇总", 0)
@@ -452,7 +514,7 @@ def run():
     existing_excel = st.file_uploader(
         "上传已有的报表 Excel（可选，用于合并）",
         type=["xlsx"],
-        help="之前生成的 Excel 文件，新日期数据会追加进去，已有日期不会被覆盖",
+        help="之前的报表 Excel，新识别的日期数据会填入空白天的sheet，已有流水数据的天不会被覆盖",
     )
 
     uploaded_photos = st.file_uploader(
@@ -467,7 +529,6 @@ def run():
                    (f" + 1 个已有 Excel" if existing_excel else ""))
 
         if st.button("🚀 开始识别", type="primary"):
-            # 读取已有 Excel
             if existing_excel:
                 try:
                     st.session_state.restaurant_existing_wb = load_workbook(existing_excel)
@@ -494,21 +555,21 @@ def run():
                     st.error(f"识别 {f.name} 失败: {e}")
             prog.progress(1.0, text="全部识别完成！")
 
-            # 检查哪些日期已存在
+            # 检查哪些日期在已有 Excel 中已有实际流水
             if st.session_state.restaurant_existing_wb:
-                existing = set(st.session_state.restaurant_existing_wb.sheetnames)
+                wb_exist = st.session_state.restaurant_existing_wb
                 skipped = []
                 for day in all_days:
                     try:
                         dt = datetime.strptime(day["date"], "%Y-%m-%d")
-                        if str(dt.day) in existing:
+                        sn = str(dt.day)
+                        if sn in wb_exist.sheetnames and _sheet_has_data(wb_exist[sn]):
                             skipped.append(day["date"])
                     except Exception:
                         pass
                 if skipped:
-                    st.warning(f"以下日期在已有 Excel 中已存在，将跳过不覆盖：{', '.join(skipped)}")
+                    st.warning(f"以下日期在已有 Excel 中已有流水数据，将跳过不覆盖：{', '.join(skipped)}")
 
-            # 识别完成后处理备注+校验
             for day in all_days:
                 _process_notes(day)
                 _validate_day(day)
@@ -521,7 +582,6 @@ def run():
     if st.session_state.restaurant_results and not st.session_state.restaurant_confirmed:
         all_days = st.session_state.restaurant_results
 
-        # 每次渲染前重新校验（用户可能已在上一次交互中修改了数值）
         for day in all_days:
             _validate_day(day)
 
@@ -635,7 +695,6 @@ def run():
                 all_days[di]["notes"] = st.text_area(
                     "备注", value=day.get("notes", ""), key=f"nt_{di}", height=60)
 
-        # 确认按钮：再次校验，有问题则警告
         if st.button("✅ 确认无误，生成报表", type="primary"):
             for day in all_days:
                 _validate_day(day)
