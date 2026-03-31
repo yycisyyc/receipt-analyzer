@@ -490,6 +490,36 @@ def run():
     st.title("📋 餐厅日报表")
     st.caption("上传手写日报照片，AI 识别后生成标准 Excel 日报表")
 
+    st.markdown("""<style>
+    [data-testid="stFileUploaderDropzoneInstructions"] div span {
+        visibility: hidden; position: relative;
+    }
+    [data-testid="stFileUploaderDropzoneInstructions"] div span::after {
+        content: "将文件拖拽到此处"; visibility: visible;
+        position: absolute; left: 0; right: 0; text-align: center;
+    }
+    [data-testid="stFileUploaderDropzoneInstructions"] div small {
+        visibility: hidden; position: relative;
+    }
+    [data-testid="stFileUploaderDropzoneInstructions"] div small::after {
+        visibility: visible; position: absolute; left: 0; right: 0;
+        text-align: center;
+    }
+    [data-testid="stFileUploaderDropzone"] button {
+        visibility: hidden; position: relative;
+    }
+    [data-testid="stFileUploaderDropzone"] button::after {
+        content: "选择文件"; visibility: visible;
+        position: absolute; left: 0; right: 0; text-align: center;
+    }
+    section[data-testid="stFileUploader"] small {
+        visibility: hidden; position: relative;
+    }
+    section[data-testid="stFileUploader"] small::after {
+        visibility: visible; position: absolute; left: 0;
+    }
+    </style>""", unsafe_allow_html=True)
+
     if st.button("⬅️ 返回主页"):
         st.session_state.current_page = "home"
         st.rerun()
