@@ -4,6 +4,7 @@ import json
 import re
 import io
 import copy
+import math
 from datetime import datetime
 from PIL import Image
 from openai import OpenAI
@@ -152,6 +153,11 @@ def _parse_json(raw):
         raise ValueError(f"无法解析:\n{raw[:500]}")
 
 
+def _ceil2(x):
+    """向上进位到两位小数（0.237 → 0.24）。"""
+    return math.ceil(x * 100) / 100
+
+
 def _get_fee_rate(method: str) -> float:
     method = method.strip()
     return FEE_RATES.get(method, 0.0038)
@@ -259,8 +265,8 @@ def _flatten_rows_for_excel(rows):
             is_guazhang = method == "挂帐"
             fee_rate = _get_fee_rate(method)
             income = 0 if (is_member or is_guazhang) else amount
-            fee = round(income * fee_rate, 2)
-            actual = round(income - fee, 2)
+            fee = _ceil2(income * fee_rate)
+            actual = _ceil2(income - fee)
 
             flat.append({
                 "seq": seq,
@@ -305,7 +311,7 @@ def _fill_day_data(ws, day_data):
             ws.cell(row=r, column=4, value=entry["revenue"])
 
         if entry["is_first"] and entry["revenue"] and entry["row_income"]:
-            discount = round(entry["revenue"] - entry["row_income"], 2)
+            discount = _ceil2(entry["revenue"] - entry["row_income"])
             if discount > 0:
                 ws.cell(row=r, column=5, value=discount)
 
@@ -363,7 +369,7 @@ def _write_day_sheet(ws, day_data):
             ws.cell(row=r, column=4, value=entry["revenue"]).number_format = _MFMT
 
         if entry["is_first"] and entry["revenue"] and entry["row_income"]:
-            discount = round(entry["revenue"] - entry["row_income"], 2)
+            discount = _ceil2(entry["revenue"] - entry["row_income"])
             if discount > 0:
                 ws.cell(row=r, column=5, value=discount).number_format = _MFMT
 
