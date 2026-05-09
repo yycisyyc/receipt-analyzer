@@ -287,47 +287,233 @@ def _flatten_rows_for_excel(rows):
     return flat
 
 
-def _fill_day_data(ws, day_data):
-    """往已有模板 sheet 中填入数据（只写数据行 3-27，保留表头和合计公式）。"""
-    # 清空数据区 B3:R27
-    for r in range(3, 28):
-        for c in range(2, 19):
-            ws.cell(row=r, column=c).value = None
+# ---------------------------------------------------------------------------
+# 合并单元格安全处理
+# ---------------------------------------------------------------------------
+# 设计目标：真正兼容用户各种合并单元格模板，而非简单跳过。
+#
+# 诊断级别（严重性由低到高）：
+#   INFO    清空操作落在合并块上，行为等价（清锚点 == 清整块）
+#   NOTICE  单次写入被重定向到合并块锚点，数据未丢失但格式需用户确认
+#   CONFLICT 多条数据竞争同一个合并锚点，仅保留首条（选项 1 策略）
+#   REJECT  合并块跨越数据区边界（如 B2:B5 跨表头和数据区），为保护模板完全不动
+
+_DIAG_INFO = "INFO"
+_DIAG_NOTICE = "NOTICE"
+_DIAG_CONFLICT = "CONFLICT"
+_DIAG_REJECT = "REJECT"
+
+_DATA_ROW_MIN = 3   # 数据区第一行
+_DATA_ROW_MAX = 27  # 数据区最后一行
+_DATA_COL_MIN = 2   # 数据区第一列 (B)
+_DATA_COL_MAX = 18  # 数据区最后一列 (R)
+
+
+def _build_merge_map(ws):
+    """构建 (row,col) -> 合并信息 的映射。
+    返回:
+        merge_map: {(r,c): {"anchor": (ar,ac), "range": "B3:D3",
+                            "min_row","max_row","min_col","max_col",
+                            "crosses_boundary": bool}}
+    """
+    merge_map = {}
+    for mr in ws.merged_cells.ranges:
+        ar, ac = mr.min_row, mr.min_col
+        range_str = str(mr)
+        crosses = (
+            mr.min_row < _DATA_ROW_MIN or mr.max_row > _DATA_ROW_MAX
+            or mr.min_col < _DATA_COL_MIN or mr.max_col > _DATA_COL_MAX
+        )
+        info = {
+            "anchor": (ar, ac),
+            "range": range_str,
+            "min_row": mr.min_row, "max_row": mr.max_row,
+            "min_col": mr.min_col, "max_col": mr.max_col,
+            "crosses_boundary": crosses,
+        }
+        for r in range(mr.min_row, mr.max_row + 1):
+            for c in range(mr.min_col, mr.max_col + 1):
+                merge_map[(r, c)] = info
+    return merge_map
+
+
+def _cell_ref(r, c):
+    return f"{get_column_letter(c)}{r}"
+
+
+def _safe_set(ws, merge_map, r, c, value, *, diagnostics, sheet_name,
+              field_desc="", written_anchors=None):
+    """安全写入：自动处理合并单元格。
+
+    written_anchors: set，记录本轮已写过的锚点；用于检测 CONFLICT。
+                     由调用方（每个数据行写入前）维护。
+    field_desc: 字段说明，用于诊断信息可读性（如"序号"/"房号"）。
+    返回: True 正常写入 / False 被合并规则拒绝。
+    """
+    info = merge_map.get((r, c))
+    target_ref = _cell_ref(r, c)
+
+    if info is None:
+        # 普通 Cell，直接写
+        ws.cell(row=r, column=c, value=value)
+        return True
+
+    # 跨边界合并：拒绝写入，保护模板
+    if info["crosses_boundary"]:
+        diagnostics.append({
+            "level": _DIAG_REJECT,
+            "sheet": sheet_name,
+            "range": info["range"],
+            "target": target_ref,
+            "field": field_desc,
+            "value": value,
+            "msg": f"合并区 {info['range']} 跨越表头/数据区边界，为保护模板未写入。",
+        })
+        return False
+
+    anchor = info["anchor"]
+    anchor_ref = _cell_ref(*anchor)
+
+    # 冲突检测：同一轮已经写过这个锚点
+    if written_anchors is not None and anchor in written_anchors:
+        diagnostics.append({
+            "level": _DIAG_CONFLICT,
+            "sheet": sheet_name,
+            "range": info["range"],
+            "target": target_ref,
+            "anchor": anchor_ref,
+            "field": field_desc,
+            "value": value,
+            "msg": (f"合并区 {info['range']} 的锚点 {anchor_ref} 已被本行/前一条数据占用，"
+                    f"当前值「{value}」未能写入（只保留首条数据）。"),
+        })
+        return False
+
+    # 重定向到锚点写入
+    ws.cell(row=anchor[0], column=anchor[1], value=value)
+    if written_anchors is not None:
+        written_anchors.add(anchor)
+
+    # 位置重定向了才告警；锚点就是目标本身的话属于正常情况
+    if (r, c) != anchor:
+        diagnostics.append({
+            "level": _DIAG_NOTICE,
+            "sheet": sheet_name,
+            "range": info["range"],
+            "target": target_ref,
+            "anchor": anchor_ref,
+            "field": field_desc,
+            "value": value,
+            "msg": (f"目标单元格 {target_ref} 属于合并区 {info['range']}，"
+                    f"已改写入锚点 {anchor_ref}。"),
+        })
+    return True
+
+
+def _safe_clear_range(ws, merge_map, r1, c1, r2, c2, *, diagnostics, sheet_name):
+    """安全清空指定矩形区域。
+    - 普通 Cell 置空
+    - 合并块：若完全落在数据区内，只清锚点（等价清整块），记 INFO
+    - 合并块：若跨边界，完全不动，记 REJECT
+    - 合并块非锚点位置不重复记录
+    """
+    seen_anchors = set()
+    for r in range(r1, r2 + 1):
+        for c in range(c1, c2 + 1):
+            info = merge_map.get((r, c))
+            if info is None:
+                ws.cell(row=r, column=c, value=None)
+                continue
+
+            anchor = info["anchor"]
+            if anchor in seen_anchors:
+                continue
+            seen_anchors.add(anchor)
+
+            if info["crosses_boundary"]:
+                diagnostics.append({
+                    "level": _DIAG_REJECT,
+                    "sheet": sheet_name,
+                    "range": info["range"],
+                    "target": _cell_ref(r, c),
+                    "msg": f"清空时遇到跨边界合并区 {info['range']}，已保留原值未清空。",
+                })
+                continue
+
+            # 合并块在数据区内：清锚点即清整块
+            ar, ac = anchor
+            ws.cell(row=ar, column=ac, value=None)
+            diagnostics.append({
+                "level": _DIAG_INFO,
+                "sheet": sheet_name,
+                "range": info["range"],
+                "anchor": _cell_ref(ar, ac),
+                "msg": f"清空了合并区 {info['range']}（通过清锚点 {_cell_ref(ar, ac)} 实现）。",
+            })
+
+
+def _fill_day_data(ws, day_data, *, diagnostics=None, sheet_name=""):
+    """往已有模板 sheet 中填入数据（只写数据行 3-27，保留表头和合计公式）。
+
+    兼容合并单元格：
+    - 清空数据区时跳过跨边界合并块，对纯数据区内合并块只清锚点
+    - 写入数据时自动重定向到合并块锚点，多行竞争同锚点时仅保留首条并告警
+    """
+    if diagnostics is None:
+        diagnostics = []  # 独立调用时不抛异常，只是不收集
+    merge_map = _build_merge_map(ws)
+
+    # 清空数据区 B3:R27（安全方式）
+    _safe_clear_range(ws, merge_map,
+                      _DATA_ROW_MIN, _DATA_COL_MIN,
+                      _DATA_ROW_MAX, _DATA_COL_MAX,
+                      diagnostics=diagnostics, sheet_name=sheet_name)
 
     flat = _flatten_rows_for_excel(day_data.get("rows", []))
-    current_row = 3
+    current_row = _DATA_ROW_MIN
 
     for entry in flat:
-        if current_row > 27:
+        if current_row > _DATA_ROW_MAX:
             break
         r = current_row
         current_row += 1
 
-        ws.cell(row=r, column=1, value=entry["seq"])
-        ws.cell(row=r, column=2, value=entry["period"])
-        ws.cell(row=r, column=3, value=entry["room"])
+        # 每个数据行用独立的 written_anchors，避免跨行误报冲突
+        written = set()
+
+        def put(col, value, field):
+            _safe_set(ws, merge_map, r, col, value,
+                      diagnostics=diagnostics, sheet_name=sheet_name,
+                      field_desc=field, written_anchors=written)
+
+        put(1, entry["seq"], "序号")
+        put(2, entry["period"], "时段")
+        put(3, entry["room"], "房号")
 
         if entry["is_first"] and entry["revenue"]:
-            ws.cell(row=r, column=4, value=entry["revenue"])
+            put(4, entry["revenue"], "营业额")
 
         if entry["is_first"] and entry["revenue"] and entry["row_income"]:
             discount = _ceil2(entry["revenue"] - entry["row_income"])
             if discount > 0:
-                ws.cell(row=r, column=5, value=discount)
+                put(5, discount, "折扣")
 
-        ws.cell(row=r, column=6, value=entry["income"])
-        ws.cell(row=r, column=7, value=entry["fee"])
-        ws.cell(row=r, column=9, value=f"=F{r}-G{r}")
-        ws.cell(row=r, column=15, value=entry["payment"])
+        put(6, entry["income"], "收入")
+        put(7, entry["fee"], "手续费")
+        put(9, f"=F{r}-G{r}", "实收公式")
+        put(15, entry["payment"], "付款方式")
 
         if entry.get("drinks"):
-            ws.cell(row=r, column=16, value=entry["drinks"])
+            put(16, entry["drinks"], "酒水")
         if entry.get("row_note"):
-            ws.cell(row=r, column=17, value=entry["row_note"])
+            put(17, entry["row_note"], "备注")
 
     notes = day_data.get("notes", "")
     if notes:
-        ws.cell(row=29, column=10, value=f"备注：{notes}")
+        # 备注写在 J29（非数据区），这里不需要合并单元格处理；但为稳妥也走 safe_set
+        _safe_set(ws, merge_map, 29, 10, f"备注：{notes}",
+                  diagnostics=diagnostics, sheet_name=sheet_name,
+                  field_desc="日备注")
 
 
 def _write_day_sheet(ws, day_data):
@@ -452,13 +638,150 @@ def _write_summary_sheet(ws, day_sheets: list[str]):
         c.font = _BFONT
 
 
+def _write_diagnostic_sheet(wb, diagnostics):
+    """把收集到的诊断信息写入一个新的 sheet "_诊断说明"。
+    面向普通用户：用简明中文告诉用户哪些位置因合并单元格而被特殊处理，
+    请用户人工核对。
+    """
+    # 去掉旧的诊断 sheet（如果存在），避免重复
+    if "_诊断说明" in wb.sheetnames:
+        del wb["_诊断说明"]
+    ws = wb.create_sheet("_诊断说明")
+
+    # 样式
+    yellow = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+    red_font = Font(bold=True, color="C00000")
+    bold = Font(bold=True)
+
+    ws.column_dimensions["A"].width = 16
+    ws.column_dimensions["B"].width = 14
+    ws.column_dimensions["C"].width = 18
+    ws.column_dimensions["D"].width = 14
+    ws.column_dimensions["E"].width = 14
+    ws.column_dimensions["F"].width = 55
+
+    ws["A1"] = "合并单元格处理诊断报告"
+    ws["A1"].font = Font(bold=True, size=14)
+
+    ws["A2"] = ("说明：模板中存在合并单元格时，程序会根据规则安全处理。"
+                "请核对下列位置的内容是否符合预期。")
+    ws.merge_cells("A2:F2")
+
+    if not diagnostics:
+        ws["A4"] = "本次生成未发现合并单元格相关处理情况，所有数据已按标准方式写入。"
+        return
+
+    # 级别说明
+    legend = [
+        ("级别图例：", ""),
+        ("ℹ️ 信息", "清空操作落在合并块上，已通过清锚点实现等价清空。"),
+        ("⚠️ 注意", "写入位置被重定向到合并块锚点，数据未丢失但格式需确认。"),
+        ("❌ 冲突", "多条数据竞争同一合并锚点，仅保留首条，其余未写入。"),
+        ("🚫 拒绝", "合并块跨越表头/数据区边界，为保护模板完全未动。"),
+    ]
+    for i, (a, b) in enumerate(legend, start=4):
+        ws.cell(row=i, column=1, value=a).font = bold
+        ws.cell(row=i, column=2, value=b)
+    ws.merge_cells(start_row=4, start_column=2, end_row=4, end_column=6)
+    for i in range(5, 9):
+        ws.merge_cells(start_row=i, start_column=2, end_row=i, end_column=6)
+
+    # 表头
+    header_row = 10
+    headers = ["级别", "所在 Sheet", "合并范围", "目标格", "锚点格", "说明"]
+    for ci, h in enumerate(headers, 1):
+        c = ws.cell(row=header_row, column=ci, value=h)
+        c.font = bold
+        c.fill = yellow
+
+    # 排序：REJECT/CONFLICT 优先展示，便于用户一眼看到需要处理的问题
+    level_order = {_DIAG_REJECT: 0, _DIAG_CONFLICT: 1,
+                   _DIAG_NOTICE: 2, _DIAG_INFO: 3}
+    level_label = {
+        _DIAG_INFO: "ℹ️ 信息",
+        _DIAG_NOTICE: "⚠️ 注意",
+        _DIAG_CONFLICT: "❌ 冲突",
+        _DIAG_REJECT: "🚫 拒绝",
+    }
+    sorted_diags = sorted(
+        diagnostics,
+        key=lambda d: (level_order.get(d["level"], 99),
+                       d.get("sheet", ""), d.get("range", ""))
+    )
+
+    row = header_row + 1
+    for d in sorted_diags:
+        lvl = d["level"]
+        ws.cell(row=row, column=1, value=level_label.get(lvl, lvl))
+        ws.cell(row=row, column=2, value=d.get("sheet", ""))
+        ws.cell(row=row, column=3, value=d.get("range", ""))
+        ws.cell(row=row, column=4, value=d.get("target", ""))
+        ws.cell(row=row, column=5, value=d.get("anchor", ""))
+        ws.cell(row=row, column=6, value=d.get("msg", ""))
+        if lvl in (_DIAG_CONFLICT, _DIAG_REJECT):
+            for ci in range(1, 7):
+                ws.cell(row=row, column=ci).font = red_font
+        row += 1
+
+    # 统计汇总
+    row += 1
+    counts = {}
+    for d in diagnostics:
+        counts[d["level"]] = counts.get(d["level"], 0) + 1
+    ws.cell(row=row, column=1, value="统计：").font = bold
+    summary_text = "  ".join(
+        f"{level_label.get(k, k)}: {counts[k]}" for k in
+        [_DIAG_REJECT, _DIAG_CONFLICT, _DIAG_NOTICE, _DIAG_INFO] if k in counts
+    )
+    ws.cell(row=row, column=2, value=summary_text)
+    ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=6)
+
+
+def _highlight_problem_cells(wb, diagnostics):
+    """对 CONFLICT / REJECT 级别的问题位置，在对应的日 sheet 中用黄底 + 红字标记，
+    方便用户直接在日报表上看到需要确认的格子。
+    """
+    yellow = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+    red_font = Font(bold=True, color="C00000")
+    for d in diagnostics:
+        if d["level"] not in (_DIAG_CONFLICT, _DIAG_REJECT):
+            continue
+        sheet = d.get("sheet")
+        if not sheet or sheet not in wb.sheetnames:
+            continue
+        ws = wb[sheet]
+        # 锚点优先（合并块只能在锚点上改样式），否则用目标格
+        target = d.get("anchor") or d.get("target")
+        if not target:
+            continue
+        try:
+            cell = ws[target]
+            cell.fill = yellow
+            if cell.font:
+                cell.font = Font(
+                    name=cell.font.name, size=cell.font.size,
+                    bold=True, color="C00000",
+                )
+            else:
+                cell.font = red_font
+        except Exception:
+            # 某些合并格不能直接设样式，静默忽略
+            pass
+
+
 def _build_excel(all_days, existing_wb=None):
-    """生成完整 Excel，支持合并已有工作簿。"""
+    """生成完整 Excel，支持合并已有工作簿。
+
+    兼容合并单元格模板：所有写入/清空走安全路径，并收集诊断信息，
+    最终在工作簿末尾追加一个 "_诊断说明" sheet 给用户核对。
+    """
     if existing_wb:
         wb = existing_wb
     else:
         wb = Workbook()
         wb.remove(wb.active)
+
+    diagnostics = []
 
     for day_data in sorted(all_days, key=lambda d: d.get("date", "")):
         date_str = day_data.get("date", "")
@@ -472,7 +795,8 @@ def _build_excel(all_days, existing_wb=None):
             ws = wb[sheet_name]
             if _sheet_has_data(ws):
                 continue
-            _fill_day_data(ws, day_data)
+            _fill_day_data(ws, day_data,
+                           diagnostics=diagnostics, sheet_name=sheet_name)
         else:
             ws = wb.create_sheet(sheet_name)
             _write_day_sheet(ws, day_data)
@@ -482,8 +806,15 @@ def _build_excel(all_days, existing_wb=None):
         del wb["汇总"]
     ws_summary = wb.create_sheet("汇总", 0)
 
-    day_sheets = [s for s in wb.sheetnames if s != "汇总" and s.isdigit()]
+    day_sheets = [s for s in wb.sheetnames
+                  if s not in ("汇总", "_诊断说明") and s.isdigit()]
     _write_summary_sheet(ws_summary, day_sheets)
+
+    # 对冲突/拒绝项在日报表上直接高亮
+    _highlight_problem_cells(wb, diagnostics)
+
+    # 追加诊断 sheet（放在最后）
+    _write_diagnostic_sheet(wb, diagnostics)
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -754,16 +1085,22 @@ def run():
 
     # --- 生成 & 下载 ---
     if st.session_state.restaurant_confirmed and st.session_state.restaurant_results:
-        st.success("报表生成完成！")
-        excel = _build_excel(
-            st.session_state.restaurant_results,
-            existing_wb=st.session_state.restaurant_existing_wb,
-        )
-        st.download_button(
-            "📥 下载餐厅日报表", data=excel,
-            file_name=f"餐厅日报表_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary")
+        try:
+            excel = _build_excel(
+                st.session_state.restaurant_results,
+                existing_wb=st.session_state.restaurant_existing_wb,
+            )
+        except Exception as e:
+            st.error(f"❌ 生成报表时出错：{e}")
+            st.exception(e)
+        else:
+            st.success("✅ 报表生成完成！如模板含合并单元格，请打开 Excel 查看末尾的"
+                       "『_诊断说明』工作表确认处理情况。")
+            st.download_button(
+                "📥 下载餐厅日报表", data=excel,
+                file_name=f"餐厅日报表_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary")
         if st.button("🔄 重新开始"):
             st.session_state.restaurant_results = None
             st.session_state.restaurant_confirmed = False
